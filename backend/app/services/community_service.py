@@ -3,8 +3,6 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable
 
-from aiomysql import DictCursor
-
 from app.db import Database
 from app.schemas import (
     Coordinates,
@@ -35,24 +33,22 @@ class CommunityService:
     ) -> FavoritePlaceResponse:
         insert_query = """
         INSERT INTO favorite_places (user_id, place_name, address, latitude, longitude)
-        VALUES (%s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            place_name = VALUES(place_name),
-            address = VALUES(address)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (user_id, latitude, longitude)
+        DO UPDATE SET
+            place_name = EXCLUDED.place_name,
+            address = EXCLUDED.address
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    insert_query,
-                    (
-                        user.id,
-                        request.place_name,
-                        request.address,
-                        request.latitude,
-                        request.longitude,
-                    ),
-                )
+            await connection.execute(
+                insert_query,
+                user.id,
+                request.place_name,
+                request.address,
+                request.latitude,
+                request.longitude,
+            )
 
         favorite = await self.get_favorite_place(
             user.id,
@@ -71,25 +67,22 @@ class CommunityService:
     ) -> None:
         query = """
         DELETE FROM favorite_places
-        WHERE user_id = %s AND latitude = %s AND longitude = %s
+        WHERE user_id = $1 AND latitude = $2 AND longitude = $3
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(query, (user_id, latitude, longitude))
+            await connection.execute(query, user_id, latitude, longitude)
 
     async def list_favorite_places(self, user_id: int) -> list[FavoritePlaceResponse]:
         query = """
         SELECT id, place_name, address, latitude, longitude
         FROM favorite_places
-        WHERE user_id = %s
+        WHERE user_id = $1
         ORDER BY created_at DESC
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(query, (user_id,))
-                rows = await cursor.fetchall()
+            rows = await connection.fetch(query, user_id)
 
         return [
             FavoritePlaceResponse(
@@ -111,14 +104,12 @@ class CommunityService:
         query = """
         SELECT id, place_name, address, latitude, longitude
         FROM favorite_places
-        WHERE user_id = %s AND latitude = %s AND longitude = %s
+        WHERE user_id = $1 AND latitude = $2 AND longitude = $3
         LIMIT 1
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(query, (user_id, latitude, longitude))
-                row = await cursor.fetchone()
+            row = await connection.fetchrow(query, user_id, latitude, longitude)
 
         if row is None:
             return None
@@ -139,23 +130,20 @@ class CommunityService:
         query = """
         INSERT INTO place_safety_ratings (
             user_id, place_name, address, latitude, longitude, rating_value, comment
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    query,
-                    (
-                        user.id,
-                        request.place_name,
-                        request.address,
-                        request.latitude,
-                        request.longitude,
-                        self._rating_to_score(request.rating),
-                        request.comment,
-                    ),
-                )
+            await connection.execute(
+                query,
+                user.id,
+                request.place_name,
+                request.address,
+                request.latitude,
+                request.longitude,
+                self._rating_to_score(request.rating),
+                request.comment,
+            )
 
         return await self.get_place_safety_summary(
             request.latitude,
@@ -172,13 +160,11 @@ class CommunityService:
             COALESCE(AVG(rating_value / 2.0), 0) AS normalized_score,
             COUNT(*) AS total_ratings
         FROM place_safety_ratings
-        WHERE latitude = %s AND longitude = %s
+        WHERE latitude = $1 AND longitude = $2
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(query, (latitude, longitude))
-                row = await cursor.fetchone()
+            row = await connection.fetchrow(query, latitude, longitude)
 
         normalized_score = float(row["normalized_score"] or 0)
         total_ratings = int(row["total_ratings"] or 0)
@@ -197,27 +183,25 @@ class CommunityService:
         INSERT INTO road_segment_ratings (
             user_id, segment_key, start_latitude, start_longitude,
             end_latitude, end_longitude, rating_value, comment
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor() as cursor:
+            async with connection.transaction():
                 for segment in segments:
-                    await cursor.execute(
+                    await connection.execute(
                         insert_query,
-                        (
-                            user.id,
-                            segment["segment_key"],
-                            segment["start"].latitude,
-                            segment["start"].longitude,
-                            segment["end"].latitude,
-                            segment["end"].longitude,
-                            self._rating_to_score(request.rating),
-                            request.comment,
-                        ),
+                        user.id,
+                        segment["segment_key"],
+                        segment["start"].latitude,
+                        segment["start"].longitude,
+                        segment["end"].latitude,
+                        segment["end"].longitude,
+                        self._rating_to_score(request.rating),
+                        request.comment,
                     )
 
-                await self._refresh_segment_scores(cursor, segments)
+                await self._refresh_segment_scores(connection, segments)
 
         return await self.get_road_safety_summary(request.route_points)
 
@@ -230,7 +214,7 @@ class CommunityService:
             return self._build_summary(0, 0)
 
         segment_keys = [segment["segment_key"] for segment in segments]
-        placeholders = ", ".join(["%s"] * len(segment_keys))
+        placeholders = ", ".join([f"${i+1}" for i in range(len(segment_keys))])
         query = f"""
         SELECT segment_key, normalized_score, rating_count
         FROM road_segment_safety_scores
@@ -238,9 +222,7 @@ class CommunityService:
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(query, tuple(segment_keys))
-                rows = await cursor.fetchall()
+            rows = await connection.fetch(query, *segment_keys)
 
         if not rows:
             return self._build_summary(0, 0)
@@ -264,25 +246,22 @@ class CommunityService:
         INSERT INTO safety_comments (
             user_id, target_type, target_key, place_name, address,
             latitude, longitude, comment
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    query,
-                    (
-                        user.id,
-                        request.target_type,
-                        request.target_key,
-                        request.place_name,
-                        request.address,
-                        request.latitude,
-                        request.longitude,
-                        request.comment.strip(),
-                    ),
-                )
-                comment_id = cursor.lastrowid
+            comment_id = await connection.fetchval(
+                query,
+                user.id,
+                request.target_type,
+                request.target_key,
+                request.place_name,
+                request.address,
+                request.latitude,
+                request.longitude,
+                request.comment.strip(),
+            )
 
         return SafetyCommentResponse(
             id=int(comment_id),
@@ -302,15 +281,13 @@ class CommunityService:
         SELECT c.id, c.target_type, c.target_key, c.comment, c.created_at, u.full_name
         FROM safety_comments c
         INNER JOIN users u ON u.id = c.user_id
-        WHERE c.target_type = %s AND c.target_key = %s
+        WHERE c.target_type = $1 AND c.target_key = $2
         ORDER BY c.created_at DESC
         LIMIT 20
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(query, (target_type, target_key))
-                rows = await cursor.fetchall()
+            rows = await connection.fetch(query, target_type, target_key)
 
         return [
             SafetyCommentResponse(
@@ -333,15 +310,13 @@ class CommunityService:
                c.place_name, c.address, c.latitude, c.longitude, u.full_name
         FROM safety_comments c
         INNER JOIN users u ON u.id = c.user_id
-        WHERE c.user_id = %s
+        WHERE c.user_id = $1
         ORDER BY c.created_at DESC
         LIMIT 50
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(query, (user_id,))
-                rows = await cursor.fetchall()
+            rows = await connection.fetch(query, user_id)
 
         return [
             SafetyCommentResponse(
@@ -373,21 +348,20 @@ class CommunityService:
                c.place_name, c.address, c.latitude, c.longitude, u.full_name
         FROM safety_comments c
         INNER JOIN users u ON u.id = c.user_id
-        WHERE c.latitude BETWEEN %s AND %s
-          AND c.longitude BETWEEN %s AND %s
+        WHERE c.latitude BETWEEN $1 AND $2
+          AND c.longitude BETWEEN $3 AND $4
         ORDER BY c.created_at DESC
         LIMIT 50
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(query, (
-                    latitude - lat_delta,
-                    latitude + lat_delta,
-                    longitude - lon_delta,
-                    longitude + lon_delta,
-                ))
-                rows = await cursor.fetchall()
+            rows = await connection.fetch(
+                query,
+                latitude - lat_delta,
+                latitude + lat_delta,
+                longitude - lon_delta,
+                longitude + lon_delta,
+            )
 
         return [
             SafetyCommentResponse(
@@ -466,7 +440,7 @@ class CommunityService:
 
     async def _refresh_segment_scores(
         self,
-        cursor,
+        connection,
         segments: list[dict[str, Coordinates | str]],
     ) -> None:
         processed_keys: set[str] = set()
@@ -476,40 +450,38 @@ class CommunityService:
                 continue
             processed_keys.add(segment_key)
 
-            await cursor.execute(
+            aggregate = await connection.fetchrow(
                 """
                 SELECT AVG(rating_value / 2.0) AS normalized_score, COUNT(*) AS rating_count
                 FROM road_segment_ratings
-                WHERE segment_key = %s
+                WHERE segment_key = $1
                 """,
-                (segment_key,),
+                segment_key,
             )
-            aggregate = await cursor.fetchone()
-            normalized_score = float(aggregate[0] or 0)
-            rating_count = int(aggregate[1] or 0)
+            normalized_score = float(aggregate["normalized_score"] or 0)
+            rating_count = int(aggregate["rating_count"] or 0)
             start = segment["start"]
             end = segment["end"]
 
-            await cursor.execute(
+            await connection.execute(
                 """
                 INSERT INTO road_segment_safety_scores (
                     segment_key, start_latitude, start_longitude,
                     end_latitude, end_longitude, normalized_score, rating_count
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    normalized_score = VALUES(normalized_score),
-                    rating_count = VALUES(rating_count),
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (segment_key)
+                DO UPDATE SET
+                    normalized_score = EXCLUDED.normalized_score,
+                    rating_count = EXCLUDED.rating_count,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (
-                    segment_key,
-                    start.latitude,
-                    start.longitude,
-                    end.latitude,
-                    end.longitude,
-                    normalized_score,
-                    rating_count,
-                ),
+                segment_key,
+                start.latitude,
+                start.longitude,
+                end.latitude,
+                end.longitude,
+                normalized_score,
+                rating_count,
             )
 
     def _segment_key(self, start: Coordinates, end: Coordinates) -> str:

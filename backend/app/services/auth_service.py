@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from aiomysql import DictCursor
-
 from app.config import Settings
 from app.db import Database
 from app.schemas import AuthResponse, LoginRequest, SignupRequest, UserResponse
@@ -27,16 +25,17 @@ class AuthService:
         password_hash = hash_password(request.password)
         insert_query = """
         INSERT INTO users (full_name, email, password_hash)
-        VALUES (%s, %s, %s)
+        VALUES ($1, $2, $3)
+        RETURNING id
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    insert_query,
-                    (request.full_name.strip(), request.email.lower(), password_hash),
-                )
-                user_id = cursor.lastrowid
+            user_id = await connection.fetchval(
+                insert_query,
+                request.full_name.strip(),
+                request.email.lower(),
+                password_hash,
+            )
 
         user = UserResponse(
             id=int(user_id),
@@ -64,14 +63,12 @@ class AuthService:
         select_query = """
         SELECT id, full_name, email
         FROM users
-        WHERE id = %s
+        WHERE id = $1
         LIMIT 1
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(select_query, (user_id,))
-                user_row = await cursor.fetchone()
+            user_row = await connection.fetchrow(select_query, user_id)
 
         if user_row is None:
             return None
@@ -86,14 +83,12 @@ class AuthService:
         select_query = """
         SELECT id, full_name, email, password_hash
         FROM users
-        WHERE email = %s
+        WHERE email = $1
         LIMIT 1
         """
 
         async with self._database.pool.acquire() as connection:
-            async with connection.cursor(DictCursor) as cursor:
-                await cursor.execute(select_query, (email.lower(),))
-                return await cursor.fetchone()
+            return await connection.fetchrow(select_query, email.lower())
 
     def _build_auth_response(self, user: UserResponse) -> AuthResponse:
         access_token = create_access_token(

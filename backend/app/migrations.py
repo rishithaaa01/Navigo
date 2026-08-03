@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import aiomysql
+import asyncpg
 
 
 @dataclass(frozen=True)
@@ -14,7 +14,7 @@ class Migration:
 
 
 class MigrationRunner:
-    def __init__(self, pool: aiomysql.Pool, migrations_dir: Path) -> None:
+    def __init__(self, pool: asyncpg.Pool, migrations_dir: Path) -> None:
         self._pool = pool
         self._migrations_dir = migrations_dir
 
@@ -33,21 +33,18 @@ class MigrationRunner:
             version VARCHAR(32) NOT NULL PRIMARY KEY,
             name VARCHAR(255) NOT NULL,
             applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        );
         """
 
         async with self._pool.acquire() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(query)
+            await connection.execute(query)
 
     async def _get_applied_versions(self) -> set[str]:
         query = "SELECT version FROM schema_migrations"
 
         async with self._pool.acquire() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(query)
-                rows = await cursor.fetchall()
-                return {str(row[0]) for row in rows}
+            rows = await connection.fetch(query)
+            return {str(row["version"]) for row in rows}
 
     def _load_migrations(self) -> list[Migration]:
         migrations: list[Migration] = []
@@ -64,22 +61,17 @@ class MigrationRunner:
 
     async def _apply_migration(self, migration: Migration) -> None:
         async with self._pool.acquire() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute("START TRANSACTION")
-                try:
-                    for statement in self._split_sql_statements(migration.sql):
-                        await cursor.execute(statement)
-                    await cursor.execute(
-                        """
-                        INSERT INTO schema_migrations (version, name)
-                        VALUES (%s, %s)
-                        """,
-                        (migration.version, migration.name),
-                    )
-                    await connection.commit()
-                except Exception:
-                    await connection.rollback()
-                    raise
+            async with connection.transaction():
+                for statement in self._split_sql_statements(migration.sql):
+                    await connection.execute(statement)
+                await connection.execute(
+                    """
+                    INSERT INTO schema_migrations (version, name)
+                    VALUES ($1, $2)
+                    """,
+                    migration.version,
+                    migration.name,
+                )
 
     def _split_sql_statements(self, sql: str) -> list[str]:
         statements = []
@@ -90,6 +82,6 @@ class MigrationRunner:
         return statements
 
 
-async def run_migrations(pool: aiomysql.Pool, migrations_dir: Path) -> None:
+async def run_migrations(pool: asyncpg.Pool, migrations_dir: Path) -> None:
     runner = MigrationRunner(pool, migrations_dir)
     await runner.run()
