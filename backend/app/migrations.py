@@ -74,11 +74,56 @@ class MigrationRunner:
                 )
 
     def _split_sql_statements(self, sql: str) -> list[str]:
+        """Split SQL statements while respecting dollar-quoted strings."""
         statements = []
-        for statement in sql.split(";"):
-            cleaned = statement.strip()
-            if cleaned:
-                statements.append(cleaned)
+        current = []
+        in_dollar_quote = False
+        dollar_tag = None
+        
+        lines = sql.split('\n')
+        for line in lines:
+            stripped = line.strip()
+            
+            # Check for dollar quote tags
+            if not in_dollar_quote:
+                # Look for dollar quote start (e.g., $$, $func$, $body$)
+                import re
+                match = re.search(r'\$(\w*)\$', stripped)
+                if match and 'LANGUAGE' not in stripped.upper():
+                    in_dollar_quote = True
+                    dollar_tag = match.group(0)
+                    current.append(line)
+                    continue
+            else:
+                # Look for matching dollar quote end
+                if dollar_tag in stripped:
+                    in_dollar_quote = False
+                    dollar_tag = None
+                    current.append(line)
+                    continue
+            
+            current.append(line)
+            
+            # If we hit a semicolon outside of dollar quotes, that's a statement boundary
+            if ';' in stripped and not in_dollar_quote:
+                statement = '\n'.join(current).strip()
+                if statement:
+                    # Remove trailing semicolon
+                    if statement.endswith(';'):
+                        statement = statement[:-1].strip()
+                    if statement:
+                        statements.append(statement)
+                current = []
+        
+        # Don't forget the last statement if there's no trailing semicolon
+        if current:
+            statement = '\n'.join(current).strip()
+            if statement:
+                if statement.endswith(';'):
+                    statement = statement[:-1].strip()
+                if statement:
+                    statements.append(statement)
+        
         return statements
 
 
