@@ -48,12 +48,12 @@ CREATE TABLE IF NOT EXISTS road_segment_safety_scores (
 
 -- Create trigger function for updating updated_at
 CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER AS $func$
 BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
+    NEW.updated_at = CURRENT_TIMESTAMP
+    RETURN NEW
+END
+$func$ language 'plpgsql';
 
 -- Create trigger for road_segment_safety_scores
 CREATE TRIGGER update_road_segment_safety_scores_updated_at
